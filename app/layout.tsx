@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: {
-    default: "Yun's Blog",
-    template: "%s — Yun's Blog",
+    default: "윤병현",
+    template: "%s — 윤병현",
   },
   description: "인터랙티브 데모와 함께하는 개발 블로그",
 };
