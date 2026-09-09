@@ -39,7 +39,7 @@ export default async function Home() {
             <li key={post.slug}>
               <Link
                 href={`/blog/${post.slug}`}
-                className="group -mx-3 flex flex-col gap-1 rounded-lg px-3 py-3 transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-900"
+                className="group -mx-3 flex flex-col gap-2 rounded-lg px-3 py-3 transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-900"
               >
                 <span className="flex items-baseline justify-between gap-4">
                   <span className="font-medium">{post.title}</span>
