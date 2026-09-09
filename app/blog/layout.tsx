@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { Comments } from "@/components/Comments";
 
 export default function BlogLayout({ children }: { children: ReactNode }) {
   return (
@@ -13,6 +14,7 @@ export default function BlogLayout({ children }: { children: ReactNode }) {
       <article className="prose prose-neutral dark:prose-invert max-w-none prose-headings:tracking-tight prose-a:underline-offset-4">
         {children}
       </article>
+      <Comments />
     </div>
   );
 }
