@@ -146,6 +146,12 @@ body {
   content: none;
 }
 
+/* typography 플러그인이 인용문 앞뒤에 붙이는 따옴표 제거 */
+.prose blockquote p:first-of-type::before,
+.prose blockquote p:last-of-type::after {
+  content: none;
+}
+
 /* shiki 듀얼 테마: 라이트에서는 --shiki-light 색을 쓴다 */
 code[data-theme*=" "],
 code[data-theme*=" "] span {

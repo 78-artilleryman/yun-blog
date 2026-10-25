@@ -1,0 +1,487 @@
+export const post = {
+  title: "Next.js는 왜 Cache Components를 만들었을까?",
+  description:
+    "페이지 단위로만 캐시하던 App Router의 한계부터, 정적 shell과 동적 콘텐츠로 나누는 Cache Components와 Partial Prefetching까지 정리했습니다.",
+  date: "2026-10-25",
+};
+
+export const metadata = {
+  title: post.title,
+  description: post.description,
+};
+
+import { FlowDiagram, ShellDiagram } from "./demos";
+
+<PostHeader {...post} />
+
+## 1. 들어가며
+
+최근 Next.js 16.4가 나왔습니다. 릴리스 글에서 가장 눈에 띄는 건 **Cache Components**입니다. 16.4부터 모든 앱에 권장하고, 새로 만드는 프로젝트에는 기본으로 켜져 있으며, Next.js 17부터는 아예 기본값이 된다고 합니다.
+
+Cache Components는 페이지를 미리 만들어 두는 뼈대(shell)와 요청이 올 때 채우는 부분으로 나눕니다. 이 shell은 첫 화면을 빠르게 띄울 뿐 아니라, 링크를 눌러 이동할 때도 다시 쓰여서 이동이 즉시 일어나게 만듭니다.
+
+이 글에서는 Cache Components가 **왜 나왔고, 어떤 것인지**, 그리고 같은 shell로 이동을 빠르게 만드는 **프리페칭**까지 정리해 보려고 합니다.
+
+---
+
+## 2. 기존 App Router의 문제
+
+### 2-1. 어떤 불만이 있었나
+
+[16.3 릴리스 글](https://nextjs.org/blog/next-16-3)을 보면 그동안 Next.js를 쓰면서 많이 나왔던 불만들이 정리되어 있습니다. 이 글과 관련된 건 크게 두 가지입니다.
+
+- **캐싱**: 무엇이 언제 캐시되는지 코드만 봐서는 알기 어렵고, 사용자별 데이터가 하나라도 섞이면 캐시를 아예 못 쓴다.
+- **이동**: 링크를 누르면 화면이 한동안 멈춘 것처럼 보이고, 이를 막으려는 프리페칭은 화면에 보이는 링크마다 요청을 보내서 과하다.
+
+두 불만 모두 기존 App Router의 구조에서 나옵니다. 캐싱부터 보겠습니다.
+
+### 2-2. 렌더링 결과는 페이지 단위로만 캐시됐다
+
+Next.js 14, 15의 App Router에는 캐시가 네 가지 있었습니다.
+
+| 캐시 | 위치 | 무엇을 저장하나 |
+|---|---|---|
+| **Data Cache** | 서버 | `fetch` 응답 같은 데이터 |
+| **Full Route Cache** | 서버 | 정적 라우트를 렌더링한 결과 |
+| **Router Cache** | 브라우저 | 방문했거나 프리페치한 페이지 |
+| **React `cache()`** | 서버 | 같은 요청 안에서 중복 호출한 결과 |
+
+이 중 **서버에서 렌더링 결과를 저장하는 건 Full Route Cache 하나뿐이고, 단위는 페이지 전체**입니다. 데이터는 따로 캐시할 수 있었지만, "이 컴포넌트를 렌더링한 결과"만 골라서 저장할 방법은 없었습니다.
+
+### 2-3. `cookies()` 하나로 페이지 전체가 동적이 된다
+
+페이지 단위로만 캐시할 수 있다는 건, 페이지 안에 동적인 부분이 하나라도 있으면 그 페이지를 통째로 캐시할 수 없다는 뜻입니다.
+
+쇼핑몰 헤더에 로그인한 사용자의 장바구니 개수를 보여준다고 해봅시다.
+
+```tsx
+// app/layout.tsx
+import { cookies } from 'next/headers';
+
+export default async function RootLayout({ children }) {
+  const session = (await cookies()).get('session');
+  const cartCount = await getCartCount(session?.value);
+
+  return (
+    <html>
+      <body>
+        <Header cartCount={cartCount} />
+        {children}
+      </body>
+    </html>
+  );
+}
+```
+
+`cookies()`는 요청이 와야 알 수 있는 값이라 빌드할 때 미리 렌더링할 수 없습니다. 그래서 이 값을 읽는 순간 **이 레이아웃을 쓰는 모든 라우트가 동적으로 바뀌고, Full Route Cache도 쓸 수 없게 됩니다.** 상품 정보는 며칠씩 그대로인데도 페이지 전체를 요청마다 처음부터 다시 렌더링합니다.
+
+결국 페이지는 **통째로 정적이거나, 통째로 동적이거나** 둘 중 하나였습니다.
+
+> 이 고민은 Pages Router 시절에도 있었습니다. `getServerSideProps`는 데이터가 다 준비될 때까지 페이지 전체를 막았고, `getStaticProps`를 쓰면 사용자별 데이터는 클라이언트에서 따로 받아야 했습니다.
+
+### 2-4. 링크를 누르면 화면이 멈춘다
+
+두 번째 불만인 이동 문제도 같은 곳에서 나옵니다.
+
+Next.js의 `<Link>`는 화면에 보이면 이동할 페이지를 미리 받아 둡니다. 이걸 **프리페칭**이라고 합니다. 클릭하기 전에 받아 두었으니 클릭하자마자 화면을 바꿀 수 있습니다. 그런데 Next.js 16 이전에는 미리 받아 둘 수 있는 범위가 라우트가 정적인지 동적인지에 따라 갈렸습니다.
+
+- **정적 라우트:** 페이지 전체를 미리 받습니다.
+- **동적 라우트:** 가장 가까운 `loading.tsx`까지만 미리 받습니다.
+
+2-3처럼 레이아웃에서 `cookies()`를 읽으면 모든 라우트가 동적이 되니, 대부분의 링크는 `loading.tsx`까지만 미리 받을 수 있습니다. `loading.tsx`가 없으면 받아 둘 것이 없어서, 링크를 눌러도 서버가 페이지 전체를 렌더링할 때까지 **화면이 그대로 멈춰 있습니다.** 그래서 `loading.tsx`를 라우트마다 직접 챙겨야 했고, 하나라도 빠뜨리면 그 라우트만 느려졌습니다.
+
+프리페칭 자체도 과했습니다. 화면에 보이는 **링크마다** 요청을 보냈기 때문에, 같은 라우트를 가리키는 링크가 여러 개면 요청도 여러 번 나갔습니다. 상품 목록을 스크롤만 해도 Network 탭에 요청이 쏟아지는 이유가 이것입니다.
+
+---
+
+## 3. 그동안 어떻게 버텼나
+
+### 3-1. 페이지는 정적으로, 동적 데이터는 클라이언트에서
+
+가장 흔한 방법입니다. 페이지는 정적으로 두고, 장바구니 개수처럼 사용자마다 다른 데이터는 클라이언트 컴포넌트에서 따로 가져옵니다. React Query의 `useSuspenseQuery`로 요청하고 `<Suspense>`로 로딩 화면을 띄우거나, SWR이나 `useEffect` + `fetch`를 쓰는 방식입니다. 데이터는 보통 Route Handler로 API를 따로 만들어서 받았습니다.
+
+페이지가 정적이라 CDN에서 바로 내려가는 건 장점입니다. 하지만 데이터가 도착하기까지의 과정을 보면 단계가 꽤 깁니다.
+
+<FlowDiagram
+  title="클라이언트에서 장바구니 가져오기"
+  subtitle="정적 페이지 + 클라이언트 fetch"
+  lanes={[{ label: "브라우저", icon: "monitor" }, { label: "서버", icon: "server" }]}
+  steps={[
+    { title: "HTML 요청", lane: 0, ms: 250, icon: "page" },
+    { title: "HTML 응답", lane: 1, ms: 400, icon: "server", tag: "왕복 1" },
+    { title: "JS 다운로드", lane: 0, ms: 700, icon: "download" },
+    { title: "hydration", lane: 0, ms: 600, icon: "bolt" },
+    { title: "API 요청", lane: 0, ms: 250, icon: "swap" },
+    { title: "장바구니 조회", lane: 1, ms: 600, icon: "database", tag: "왕복 2" },
+    { title: "개수 표시", lane: 0, ms: 300, icon: "cart" },
+  ]}
+/>
+
+브라우저는 JS를 받고 hydration을 마쳐야 비로소 데이터를 요청할 수 있습니다. 앞 단계가 끝나야 다음 단계가 시작되는 **폭포 구조**(waterfall)라서, 화면은 빨리 떠도 데이터는 늦게 채워집니다. 데이터를 가져오는 코드가 클라이언트로 넘어가니 Server Components를 쓰는 이점도 줄어듭니다.
+
+### 3-2. 서버에서 미리 받아서 클라이언트 캐시에 넘기기
+
+폭포를 없애려고 서버에서 데이터를 미리 받아 두는 방법도 쓰였습니다. React Query라면 서버 컴포넌트에서 `prefetchQuery`로 데이터를 받고, `HydrationBoundary`로 클라이언트 캐시에 채워서 내려보냅니다.
+
+```tsx
+// 서버 컴포넌트
+const queryClient = new QueryClient();
+await queryClient.prefetchQuery({ queryKey: ['cart'], queryFn: getCart });
+
+return (
+  <HydrationBoundary state={dehydrate(queryClient)}>
+    <Cart />
+  </HydrationBoundary>
+);
+```
+
+클라이언트에서 다시 요청하지 않으니 폭포는 사라집니다. 하지만 서버에서 사용자별 데이터를 읽는 순간 2-3과 똑같이 **페이지 전체가 동적**이 됩니다. 같은 데이터를 서버와 클라이언트 캐시 양쪽에서 관리해야 하는 부담도 생깁니다.
+
+### 3-3. 페이지 전체를 동적으로 두고 스트리밍하기
+
+동적 라우트에 `loading.tsx`를 두거나 느린 부분을 `<Suspense>`로 감싸면, 서버가 준비된 부분부터 흘려보냅니다. 한 번의 요청으로 끝나니 폭포는 없습니다.
+
+대신 안 바뀌는 부분까지 요청마다 다시 렌더링합니다. 미리 만들어 둔 화면이 없으니, 서버가 응답을 시작할 때까지는 아무것도 보여줄 수 없습니다.
+
+### 3-4. 페이지 전체를 정적으로 두고 주기적으로 갱신하기
+
+`revalidate`를 설정한 ISR이나 `generateStaticParams`로 페이지를 미리 만들어 두면 가장 빠릅니다. 하지만 사용자별 데이터는 넣을 수 없어서, 결국 3-1 방식과 섞어 쓰게 됩니다.
+
+### 3-5. 무엇을 포기했나
+
+| 방법 | 정적 부분 즉시 표시 | 사용자별 데이터 | 왕복 수 |
+|---|---|---|---|
+| 클라이언트 fetch | O | O | 2번 이상 |
+| 서버 prefetch + hydrate | X (페이지 전체가 동적) | O | 1번 |
+| 전체 동적 + 스트리밍 | X (매번 렌더링) | O | 1번 |
+| ISR | O | X | 1번 |
+
+어느 방법이든 하나씩은 포기해야 했습니다. 바라는 건 이런 것입니다.
+
+> 안 바뀌는 부분은 **미리** 만들어 두고, 바뀌는 부분만 **요청할 때** 렌더링하고, 그 둘을 **한 번의 응답**으로 보내기.
+
+이걸 가능하게 하는 것이 Cache Components입니다.
+
+---
+
+## 4. Cache Components
+
+> **이름 때문에 헷갈리기 쉬운 점**
+>
+> Cache Components는 "캐시되는 컴포넌트"라는 컴포넌트 종류가 아니라, 이 장에서 볼 렌더링, 캐싱 방식 전체의 이름입니다. 뒤에 나올 `'use cache'`를 붙인 컴포넌트는 "캐시된 서버 컴포넌트"라고 부르는 게 정확합니다.
+
+### 4-1. 정적 shell과 동적 콘텐츠
+
+Cache Components의 출발점은 간단합니다. 페이지를 통째로 정적이거나 통째로 동적으로 두지 말고, **한 페이지 안에서 미리 만들어 둘 수 있는 부분과 요청이 와야 만들 수 있는 부분을 나누자**는 것입니다.
+
+상품 상세 페이지를 예로 들면, 상품 이미지와 이름, 설명은 누가 언제 보든 똑같습니다. 반면 헤더의 장바구니 개수는 로그인한 사용자마다 다르고, 재고는 수시로 바뀝니다. 앞의 것은 빌드할 때 미리 만들어 둘 수 있고, 뒤의 것은 요청이 와야만 만들 수 있습니다.
+
+<ShellDiagram />
+
+이 글에서는 미리 만들어 두는 부분을 **정적 shell**(static shell), 요청 시점에 채우는 부분을 **동적 콘텐츠**(dynamic content)라고 하겠습니다. 괄호 안은 공식 문서에서 쓰는 영어 표현입니다. shell은 페이지의 뼈대이자 사용자가 가장 먼저 보게 되는 화면이고, 동적 콘텐츠는 그 뼈대 안에 비워 둔 자리에 요청 시점에 채워지는 내용입니다.
+
+Next.js가 shell과 동적 콘텐츠를 나누는 기준은 React의 `<Suspense>`입니다.
+
+```tsx
+export default function Page() {
+  return (
+    <>
+      <header>
+        <Logo />
+        {/* 동적 콘텐츠: cookies()로 사용자를 확인해서 장바구니 개수 조회 */}
+        <Suspense fallback={<span>장바구니: -</span>}>
+          <CartCount />
+        </Suspense>
+      </header>
+
+      <main>
+        {/* 정적 shell: 상품 이미지, 이름, 설명 ('use cache'로 캐시, 4-2에서 설명) */}
+        <ProductInfo id="1" />
+
+        {/* 동적 콘텐츠: 요청마다 재고 조회 */}
+        <Suspense fallback={<p>재고 확인 중...</p>}>
+          <Stock id="1" />
+        </Suspense>
+      </main>
+    </>
+  );
+}
+```
+
+빌드할 때 Next.js는 이 페이지를 미리 렌더링(prerender)해 봅니다. 로고와 캐시해 둔 `ProductInfo`처럼 요청 정보 없이도 그릴 수 있는 부분은 끝까지 렌더링해서 shell에 넣습니다. 그러다 `<Suspense>` 안에서 요청이 와야만 알 수 있는 데이터를 만나면, 그 안쪽은 더 렌더링하지 않고 `fallback`을 그 자리에 넣어 둡니다. 장바구니 자리에는 "장바구니: -"가, 재고 자리에는 "재고 확인 중..."이 들어갑니다. 이렇게 완성된 shell은 HTML과 RSC payload(서버 컴포넌트를 렌더링한 결과를 React가 읽을 수 있게 바꾼 데이터) 형태로 저장되고, 요청이 오면 서버가 다시 렌더링할 필요 없이 바로 꺼내서 보낼 수 있습니다.
+
+원래 로딩 상태를 표현하려고 쓰던 `<Suspense>`가 그대로 "여기서부터 동적"이라는 경계 역할을 하는 셈이라, 새로운 문법을 배울 필요가 없습니다. `<Suspense>`를 여러 개 두면 동적 콘텐츠 자리도 여러 개가 되고, 각 자리는 서로를 기다리지 않고 준비되는 대로 따로 채워집니다. 장바구니 개수가 먼저 오든 재고가 먼저 오든 상관없습니다.
+
+이제 실제로 요청이 왔을 때를 보겠습니다. 서버는 저장해 둔 shell을 곧바로 보내기 시작하고, **그와 동시에** 동적 콘텐츠인 장바구니 개수와 재고를 렌더링합니다. 응답은 shell을 보냈다고 끝나지 않고 연결이 열린 채로 유지됩니다. 동적 콘텐츠 하나가 다 그려지면 서버는 그 HTML 조각을 같은 응답에 이어 붙여 보내고, 함께 보낸 작은 스크립트가 fallback 자리에 실제 내용을 끼워 넣습니다. 모든 동적 콘텐츠가 채워지면 그제야 응답이 끝납니다.
+
+<FlowDiagram
+  title="Cache Components에서 페이지 요청하기"
+  subtitle="shell을 먼저 보내고, 동적 콘텐츠는 같은 응답에 이어서"
+  lanes={[{ label: "브라우저", icon: "monitor" }, { label: "서버", icon: "server" }]}
+  steps={[
+    { title: "HTML 요청", lane: 0, ms: 250, icon: "page" },
+    { id: "shell", title: "저장된 shell 전송", lane: 1, ms: 150, icon: "server", tag: "응답 시작" },
+    [
+      {
+        title: "shell 표시",
+        lane: 0,
+        ms: 300,
+        icon: "monitor",
+        after: ["shell"],
+        span: 3,
+        slots: [
+          { fallback: "장바구니: -", result: "장바구니: 3", ms: 250, after: ["cart"] },
+          { fallback: "재고 확인 중...", result: "12개 남음", ms: 250, after: ["stock"] },
+        ],
+      },
+      { id: "cart", title: "장바구니 렌더링", lane: 1, ms: 700, icon: "user", after: ["shell"] },
+      { id: "stock", title: "재고 렌더링", lane: 1, ms: 1300, icon: "database", after: ["shell"] },
+    ],
+  ]}
+/>
+
+fallback 자리에 실제 내용을 끼워 넣는 과정은 실제 응답을 보면 잘 보입니다. `cacheComponents`를 켠 테스트 페이지를 만들어 1초 걸리는 장바구니 하나만 두고 응답을 받아 보면, 핵심은 이런 순서로 옵니다.
+
+```html
+<!-- ① 바로 도착: shell -->
+<main>
+  <h1>SHOP</h1>
+  <!--$?--><template id="B:0"></template>
+  <span>장바구니: -</span>
+  <!--/$-->
+</main>
+<script>self.__next_f.push(/* shell의 RSC payload */)</script>
+
+<!-- ② 1초 뒤, 같은 응답에 이어서 도착 -->
+<script>self.__next_f.push(/* 장바구니 부분의 RSC payload */)</script>
+<div hidden id="S:0"><span>장바구니: 3</span></div>
+<script>$RC("B:0", "S:0")</script>
+
+<!-- ③ 모든 동적 콘텐츠가 끝나면 -->
+</body></html>
+```
+
+동적 콘텐츠가 여러 개면 `B:1`/`S:1`처럼 번호만 바뀐 채 같은 과정이 준비되는 순서대로 반복되고, 마지막 조각까지 보낸 뒤에야 `</body></html>`과 함께 응답이 끝납니다.
+
+hydration도 모든 조각이 모일 때까지 기다리지 않습니다. JS는 shell과 함께 받기 시작하고, React는 `<Suspense>` 경계 단위로 **준비된 곳부터** hydration합니다. 아직 내용이 안 온 자리는 건너뛰었다가, 나중에 조각이 도착해 바꿔 끼워지면 그 자리만 이어서 hydration합니다. React 18부터 들어간 선택적 hydration(Selective Hydration)이라는 방식입니다.
+
+3-1의 클라이언트 fetch 방식과 비교하면 차이가 분명합니다. 그 방식에서는 브라우저가 HTML을 받고, JS를 받고, hydration까지 끝낸 뒤에야 장바구니 API를 다시 요청할 수 있었습니다. 여기서는 서버가 shell을 보내는 순간 이미 동적 부분을 렌더링하고 있기 때문에, 브라우저가 무언가를 다시 요청할 필요가 없고 JS 로드나 hydration을 기다릴 필요도 없습니다. **첫 요청 하나의 응답으로 모든 게 끝납니다.** 16.4 릴리스 글에서도 미리 렌더링된 부분과 요청 시점에 렌더링하는 부분을 같은 HTTP 응답으로 보낸다고 설명합니다.
+
+정적 부분은 ISR처럼 즉시 보이고, 사용자별 데이터도 넣을 수 있고, 왕복은 한 번입니다. 3-5 표에서 각 방법이 하나씩 포기해야 했던 것을 모두 가져가는 셈입니다.
+
+> **PPR(Partial Prerendering)이라는 이름을 들어봤다면**
+>
+> 이 아이디어는 2023년 Next.js 14에서 PPR이라는 실험 기능(`experimental.ppr`)으로 처음 공개됐습니다. Next.js 16에서 관련 실험 플래그들이 Cache Components 하나로 정리됐고, PPR은 따로 켜는 기능이 아니라 Cache Components 안에서 기본으로 일어나는 일이 됐습니다.
+
+### 4-2. `'use cache'`
+
+4-1에서 `ProductInfo`는 "캐시해 둔" 컴포넌트라서 shell에 들어갔습니다. 캐시하지 않으면 사정이 다릅니다. `ProductInfo`도 DB에서 상품을 조회하기 때문에, 그냥 두면 요청이 와야 그릴 수 있는 부분이 됩니다. 그러면 장바구니처럼 `<Suspense>`로 감싸야 하고, shell에는 실제 내용 대신 fallback만 남습니다.
+
+하지만 상품 이름이나 설명처럼 누가 봐도 같은 내용은 미리 그려서 shell에 넣어 두고 싶습니다. 이때 쓰는 게 `'use cache'`입니다.
+
+`'use cache'`는 한마디로 "**이 함수의 결과를 저장해 두고, 다음부터는 저장한 걸 꺼내 써라**"라는 표시입니다. 함수 맨 위에 한 줄 적기만 하면 됩니다.
+
+```tsx
+import { cacheLife, cacheTag } from 'next/cache';
+
+async function ProductInfo({ id }: { id: string }) {
+  'use cache';               // ① 이 컴포넌트를 렌더링한 결과를 저장
+  cacheLife('hours');        // ② 몇 시간 동안 유지
+  cacheTag(`product-${id}`); // ③ 나중에 이 캐시만 골라서 비울 때 쓰는 이름표
+
+  const product = await db.product.find(id);
+  return (
+    <section>
+      <img src={product.image} alt={product.name} />
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+    </section>
+  );
+}
+```
+
+처음 한 번은 DB를 조회해서 렌더링하고, 그 결과를 저장합니다. 다음 요청부터는 DB 조회도 렌더링도 건너뛰고 저장해 둔 결과를 바로 꺼냅니다. 인자인 `id`가 저장할 때의 이름(캐시 키)이 되므로 상품마다 따로 저장됩니다.
+
+`'use cache'`는 어디에 붙이느냐에 따라 저장되는 단위가 달라집니다.
+
+| 붙이는 곳 | 저장되는 것 |
+|---|---|
+| 데이터 함수 | 데이터 |
+| 컴포넌트 | 그 컴포넌트를 렌더링한 결과 |
+| 페이지, 레이아웃 (파일 맨 위) | 라우트 전체 |
+
+2-2에서 기존에는 렌더링 결과를 페이지 단위로만 저장할 수 있다고 했는데, 이제는 위의 `ProductInfo`처럼 **컴포넌트 하나 단위**로도 저장할 수 있습니다.
+
+#### 캐시할까, 동적 콘텐츠로 둘까
+
+페이지의 각 부분은 **누가 언제 봐도 같은지**를 기준으로 나눌 수 있습니다. 상품 정보는 누가 봐도 같고 가끔만 바뀌니 `'use cache'`로 저장합니다. 장바구니 개수는 사람마다 다르고 재고는 볼 때마다 달라지니, 캐시하지 않고 `<Suspense>`로 감싸 동적 콘텐츠로 둡니다.
+
+```tsx
+import { cookies } from 'next/headers';
+
+// 장바구니 개수: 쿠키로 사용자를 확인해야 해서 캐시하지 않음
+async function CartCount() {
+  const session = (await cookies()).get('session');
+  const count = await getCartCount(session?.value);
+  return <span>장바구니: {count}</span>;
+}
+
+// 재고: 항상 최신 값이 필요해서 캐시하지 않음
+async function Stock({ id }: { id: string }) {
+  const stock = await getStock(id);
+  return <p>{stock}개 남음</p>;
+}
+```
+
+장바구니 개수는 `cookies()`로 누구인지 확인해야 하는데, `'use cache'` 안에서는 `cookies()`나 `headers()`를 부를 수 없습니다(꼭 필요하면 바깥에서 읽어서 인자로 넘깁니다). 애초에 사람마다 결과가 다르니 저장해 둘 이유도 없습니다.
+
+`'use cache'`를 쓸 때 알아둘 규칙이 몇 가지 더 있습니다.
+
+- **인자와 반환값은 직렬화할 수 있어야 합니다.** 저장했다가 꺼낼 수 있는 값이어야 해서 함수나 클래스 인스턴스는 넘길 수 없습니다.
+- **`children`처럼 넘겨받은 JSX는 캐시 키에 들어가지 않고 그대로 통과합니다.** 그래서 캐시된 컴포넌트 안에 동적인 부분을 끼워 넣을 수 있습니다.
+- **서버에서만 쓸 수 있습니다.** 클라이언트 컴포넌트에는 붙일 수 없습니다.
+
+> **팁: 캐시 무효화**
+>
+> `cacheLife`로 유지 기간을, `cacheTag`로 이름표를 붙여 둡니다. 데이터가 바뀌면 `revalidateTag(tag, 'max')`로 오래된 캐시를 보여주면서 뒤에서 새로 만들거나, 서버 액션에서 `updateTag(tag)`로 즉시 만료시켜 방금 바꾼 내용을 바로 보여줄 수 있습니다.
+
+### 4-3. 켜는 방법
+
+Cache Components는 설정 파일에서 플래그 하나로 켭니다.
+
+```ts
+// next.config.ts
+const nextConfig: NextConfig = {
+  cacheComponents: true,
+};
+```
+
+켜면 데이터는 기본적으로 캐시되지 않고, 숨겨진 캐싱도 없습니다. 캐시되는 건 `'use cache'`를 붙인 곳뿐입니다. 2-1에서 본 "무엇이 언제 캐시되는지 코드만 봐서는 알기 어렵다"는 불만에 대한 답인 셈입니다.
+
+대신 `cookies()`, `searchParams`, 미리 정해 두지 않은 `params`, 캐시하지 않은 DB 조회처럼 요청 시점에야 알 수 있는 데이터를 읽는 곳은 앞에서 본 것처럼 `<Suspense>`로 감싸거나 `'use cache'`로 캐시해야 합니다. 둘 다 하지 않으면 개발 서버와 빌드에서 에러가 납니다.
+
+---
+
+## 5. 프리페칭
+
+여기까지가 첫 방문 이야기입니다. 주소창에 입력하거나 새로고침해서 페이지를 처음 열면, shell과 동적 콘텐츠가 한 번의 응답으로 옵니다. 하지만 앱을 쓰는 동안 화면이 바뀌는 건 대부분 첫 방문이 아니라 링크를 눌러 이동할 때입니다. 2-4에서 본 이동 문제도 바로 여기서 생깁니다.
+
+그리고 앞에서 만든 shell이 여기서 한 번 더 쓰입니다. 먼저 링크로 이동할 때 무엇을 주고받는지부터 보겠습니다.
+
+### 5-1. 링크로 이동할 때 받는 RSC payload
+
+4-1에서 shell은 HTML과 RSC payload 형태로 저장된다고 했는데, 링크 이동을 이해하려면 이 RSC payload부터 알아야 합니다. **RSC payload**는 서버 컴포넌트를 렌더링한 결과를 React가 읽을 수 있는 데이터로 바꾼 것입니다. 화면에 바로 그릴 수 있는 HTML과 달리, "이런 UI 트리를 만들어라"라는 설명서에 가깝습니다. 서버 컴포넌트 부분은 렌더링 결과가 이미 채워진 채로 들어가고, 서버 컴포넌트의 코드 자체는 브라우저로 가지 않습니다. 클라이언트 컴포넌트 부분은 "여기에 이 컴포넌트를 이 props로 넣어라"라는 자리 표시로 들어가고, 아직 준비되지 않은 `<Suspense>` 안쪽은 자리만 잡아 둡니다.
+
+```text
+1:I["./Counter.js",["chunk-abc"],"Counter"]      ← 클라이언트 컴포넌트를 가리키는 참조
+0:["$","div",null,{"children":[
+    ["$","h1",null,{"children":"Sneakers"}],     ← 서버 컴포넌트 렌더링 결과
+    ["$","$L1",null,{"initial":3}]               ← Counter 자리 + props
+  ]}]
+```
+
+HTML이 있는데도 payload를 따로 보내는 건 둘의 역할이 다르기 때문입니다. 첫 방문에서 서버는 HTML과 payload를 **하나의 응답**으로 보냅니다. payload는 HTML 안의 `<script>` 태그에 들어 있습니다. 브라우저는 HTML로 화면을 바로 그리고, JS가 로드되면 React가 payload를 읽어 전체 트리 구조를 파악한 뒤 클라이언트 컴포넌트에만 이벤트와 상태를 연결합니다. 이 과정이 hydration입니다. 서버 컴포넌트는 브라우저에 코드가 없으니 hydration 대상이 아니고, HTML로 그려진 그대로 남습니다.
+
+정리하면 HTML은 **빨리 보여주기 위한 것**이고, payload는 **React가 화면을 이어받기 위한 것**입니다.
+
+그런데 링크로 이동할 때는 다릅니다. 이때는 HTML 없이 **RSC payload만** 받아 옵니다. 개발자 도구 Network 탭을 열고 링크를 클릭하면 `?_rsc=...`가 붙은 요청이 보이는데, 이게 payload 요청입니다.
+
+React는 받은 payload를 지금 화면의 트리와 합쳐서 바뀐 부분만 반영합니다. 페이지를 통째로 갈아 끼우지 않기 때문에, 레이아웃에 있던 클라이언트 컴포넌트의 상태(입력값 등)는 그대로 유지됩니다.
+
+즉 링크로 이동할 때 필요한 건 **다음 페이지의 RSC payload**입니다. 프리페칭은 이 payload를 클릭 전에 받아 두는 것입니다. 아래 그림은 바로 다음에 볼 Partial Prefetching을 켰을 때의 흐름입니다.
+
+<FlowDiagram
+  title="링크로 이동할 때"
+  subtitle="클릭 전에 shell payload를 받아 두고, 클릭하면 바로 그린 뒤 나머지를 채움"
+  lanes={[{ label: "브라우저", icon: "monitor" }, { label: "서버", icon: "server" }]}
+  steps={[
+    { title: "링크가 화면에 보임", lane: 0, ms: 250, icon: "page" },
+    { title: "shell payload 전송", lane: 1, ms: 250, icon: "server", tag: "프리페치" },
+    { title: "Router Cache에 저장", lane: 0, ms: 300, icon: "download" },
+    { id: "click", title: "클릭", lane: 0, ms: 250, icon: "bolt" },
+    [
+      {
+        title: "shell 그리기",
+        lane: 0,
+        ms: 250,
+        icon: "monitor",
+        after: ["click"],
+        span: 3,
+        slots: [
+          { fallback: "장바구니: -", result: "장바구니: 3", ms: 250, after: ["cart"] },
+          { fallback: "재고 확인 중...", result: "12개 남음", ms: 250, after: ["stock"] },
+        ],
+      },
+      { id: "req", title: "동적 콘텐츠 요청", lane: 1, ms: 150, icon: "swap", after: ["click"], tag: "클릭 후" },
+    ],
+    [
+      { id: "cart", title: "장바구니 렌더링", lane: 1, ms: 700, icon: "user", after: ["req"] },
+      { id: "stock", title: "재고 렌더링", lane: 1, ms: 1300, icon: "database", after: ["req"] },
+    ],
+  ]}
+/>
+
+> **Router Cache**
+>
+> 프리페치한 payload는 브라우저의 Router Cache에 저장됩니다. Next.js 라우터가 JS 메모리에 들고 있는 캐시라서 새로고침하면 사라지고, 용량 상한(약 50MB)과 항목별 유효 시간이 있어 오래되면 다시 받아 옵니다.
+
+### 5-2. Partial Prefetching: 라우트마다 shell 공유
+
+Partial Prefetching은 SPA에서 아이디어를 빌려왔습니다. SPA는 라우트 단위로 코드를 나눠서 받아 두고, 그 코드로 어떤 URL이든 shell을 그립니다. Next.js도 이제 **링크마다 페이지를 받지 않고, 라우트마다 재사용 가능한 shell을 한 번만 받아서** Router Cache에 둡니다.
+
+```tsx
+<Link href="/products/1" />
+<Link href="/products/2" />
+<Link href="/products/3" />
+```
+
+| | 프리페치 요청 |
+|---|---|
+| **기존** | `/products/1`, `/products/2`, `/products/3` 각각 1번씩 |
+| **Partial Prefetching** | `/products/[id]`의 shell 1번. 세 링크가 함께 씀 |
+
+여러 링크가 shell 하나를 함께 쓸 수 있는 건, shell에 **어떤 `id`로 들어와도 똑같은 부분만** 들어가기 때문입니다. 그래서 URL의 `id`(`params`)를 읽는 부분은 `<Suspense>` 안에 둬야 합니다. shell 안에서 특정 `id`를 읽으면 공통 shell을 만들 수 없습니다.
+
+`/products/2`를 클릭하면 이렇게 됩니다.
+
+1. Router Cache에 있는 `/products/[id]` shell **즉시** 표시
+2. `/products/2`에만 해당하는 부분 요청
+3. 상품 정보는 캐시에서 바로, 장바구니와 재고는 렌더링되는 대로 채움
+
+클릭 후 왕복은 동적 부분을 받는 한 번뿐이고, 그동안 사용자는 이미 shell을 보고 있습니다. 4-1에서 첫 방문을 한 번의 왕복으로 줄였다면, 여기서는 **이동할 때도 클릭 직후 화면이 비어 있지 않게** 만든 겁니다. `loading.tsx`를 라우트마다 챙길 필요도 없습니다. `<Suspense>`를 쓴 곳이면 어디서든 shell이 자동으로 만들어집니다.
+
+켜는 방법은 플래그 하나입니다.
+
+```ts
+// next.config.ts
+const nextConfig: NextConfig = {
+  cacheComponents: true,
+  partialPrefetching: true,
+};
+```
+
+> **링크별로 더 미리 받아 두려면**
+>
+> 링크에 `prefetch={true}`를 붙이면(`<Link href="/products/2" prefetch={true}>`) 그 URL 기준으로 더 깊게 프리페치합니다. URL에서 알 수 있는 값(`params`, `searchParams`)과 `'use cache'`로 캐시된 내용까지 받아 두기 때문에, 앞의 예제라면 클릭하자마자 상품 이름과 설명까지 보입니다. 다만 장바구니나 재고처럼 요청할 때마다 렌더링하는 동적 콘텐츠는 여전히 클릭 후에 받아 옵니다.
+
+### 5-3. 확인하는 도구
+
+프리페칭은 프로덕션에서만 동작해서 개발 중에는 확인하기 어려웠습니다. 16.3에서 이를 위한 도구가 생겼습니다.
+
+- **Navigation Inspector** (Next.js DevTools): 이동을 shell 단계에서 멈춰서, 클릭 직후 사용자가 보게 될 화면을 보여줍니다.
+- **`instant()` 테스트 헬퍼** (`@next/playwright`): 클릭 직후 네트워크 없이 보여야 하는 내용을 Playwright 테스트로 검증합니다. 리팩터링하다가 즉시 이동이 깨지면 테스트가 실패합니다.
+- **Instant Insights** (개발 모드): 요청 시점 데이터를 `<Suspense>`나 `'use cache'` 없이 읽어서 바로 보여줄 화면이 없는 라우트를 찾아 해결 방법과 함께 보여줍니다. 로딩 화면 없이 서버 응답을 기다리는 게 의도라면 그 라우트에 `export const instant = false`를 적어 표시해 둡니다.
+
+---
+
+### 참고 자료
+
+- [Next.js 16](https://nextjs.org/blog/next-16)
+- [Next.js 16.3: Instant Navigations](https://nextjs.org/blog/next-16-3-instant-navigations)
+- [Next.js 16.3](https://nextjs.org/blog/next-16-3)
+- [Next.js 16.4](https://nextjs.org/blog/next-16-4)
+- [Making Navigations Instant in v0](https://nextjs.org/blog/making-v0-navigations-instant)
+- [Our Journey with Caching](https://nextjs.org/blog/our-journey-with-caching)
+- [Caching 가이드 (공식 문서)](https://nextjs.org/docs/app/getting-started/caching)
+- [Instant Navigation 가이드 (공식 문서)](https://nextjs.org/docs/app/guides/instant-navigation)
+- [New Suspense SSR Architecture in React 18 (선택적 hydration)](https://github.com/reactwg/react-18/discussions/37)
